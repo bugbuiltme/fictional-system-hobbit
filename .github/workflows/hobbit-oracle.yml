@@ -1,524 +1,701 @@
-
-name: HOBBIT Oracle Ultra-Verbose Build and Tests
+name: HOBBIT Oracle - Self Contained Ultra Verbose
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - "scripts/**"
-      - ".github/workflows/hobbit-oracle.yml"
+      - ".github/workflows/hobbit-oracle-self-contained.yml"
 
 permissions:
   contents: read
 
 concurrency:
-  group: hobbit-oracle
+  group: hobbit-oracle-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
-  hobbit:
-    name: HOBBIT Oracle Installation and Evaluation
+  hobbit-oracle:
+    name: Install, compile, evaluate, and summarize on hobbit
     runs-on: [self-hosted, Linux, X64]
-
-    # LLVM compilation can take many hours on 1 GiB RAM.
     timeout-minutes: 360
-
     defaults:
       run:
         shell: bash
-
     env:
       HOBBIT_WORKDIR: /home/ubuntu/hobbit-work
       HOBBIT_BRANCH: hashes/blake3
       HOBBIT_JOBS: "1"
       HOBBIT_SWAP_GB: "8"
-      HOBBIT_SCRIPT: scripts/hobbit_1gb_ultraverbose.sh
       PYTHONUNBUFFERED: "1"
 
     steps:
-      - name: 00 - Checkout repository
-        uses: actions/checkout@v4
-
-      - name: 01 - Verify Oracle runner identity
+      - name: 01 - Establish log paths and verify runner
         run: |
           set -Eeuo pipefail
-          echo "========================================"
-          echo "HOBBIT ORACLE RUNNER VERIFICATION"
-          echo "========================================"
-          echo "Runner: $RUNNER_NAME"
-          echo "OS: $RUNNER_OS"
-          echo "Architecture: $RUNNER_ARCH"
-          echo "Repository: $GITHUB_REPOSITORY"
-          echo "Commit: $GITHUB_SHA"
-          echo "Workflow run: $GITHUB_RUN_ID"
-          echo "Hostname: $(hostname)"
-          echo "User: $(whoami)"
-          echo "Date: $(date -Is)"
-          uname -a
-
-          if [[ "$RUNNER_NAME" != "hobbit" ]]; then
-            echo "::error::Expected runner hobbit"
+          echo "CI_LOG_DIR=$RUNNER_TEMP/hobbit-ci-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/hobbit-ci-$GITHUB_RUN_ID"
+          echo "RUNNER_NAME=$RUNNER_NAME OS=$RUNNER_OS ARCH=$RUNNER_ARCH"
+          echo "REPOSITORY=$GITHUB_REPOSITORY SHA=$GITHUB_SHA"
+          echo "USER=$(id -un) HOME=$HOME HOST=$(hostname)"
+          [[ "$RUNNER_NAME" == "hobbit" ]] || { echo '::error::Wrong runner: expected hobbit'; exit 1; }
+          [[ "$(uname -m)" == x86_64 ]] || { echo '::error::Requires x86_64'; exit 1; }
+          [[ -d /home/ubuntu ]] || { echo '::error::Expected /home/ubuntu'; exit 1; }
+          command -v python3
+          command -v bash
+          if ! sudo -n true; then
+            echo '::error::Installer requires passwordless sudo for apt, swap and sysctl'
             exit 1
           fi
 
-          if [[ "$(uname -m)" != "x86_64" ]]; then
-            echo "::error::Expected x86_64 architecture"
-            exit 1
-          fi
-
-      - name: 02 - Prepare diagnostic directory
-        if: always()
-        run: |
-          mkdir -p "$RUNNER_TEMP/hobbit-ci"
-          echo "CI_LOG_DIR=$RUNNER_TEMP/hobbit-ci" \
-            >> "$GITHUB_ENV"
-
-      - name: 03 - Ultra-verbose hardware diagnostics
+      - name: 02 - Preflight hardware, storage and kernel diagnostics
         run: |
           set -o pipefail
           {
-            echo "========== SYSTEM =========="
-            hostnamectl || true
-            uname -a
-            cat /etc/os-release
+            echo '================ PRE-FLIGHT ================='
+            date -Is; hostnamectl || true; uname -a; cat /etc/os-release
+            echo '=== CPU ==='; lscpu; nproc
+            echo '=== MEMORY ==='; free -h; cat /proc/meminfo
+            echo '=== SWAP ==='; swapon --show; cat /proc/swaps
+            echo '=== DISK ==='; df -h; df -i; lsblk
+            echo '=== LIMITS ==='; ulimit -a
+            echo '=== PRESSURE ==='; cat /proc/pressure/memory || true
+            echo '=== OOM ==='; sudo -n dmesg -T 2>/dev/null | grep -Ei 'oom|out of memory|killed process' | tail -50 || true
+            echo '=== TOOLCHAIN ==='
+            for x in gcc g++ cmake ninja python3 curl unzip git; do
+              command -v "$x" || true
+            done
+            echo '=== NETWORK ==='; ip -brief address || true; ip route || true
+            echo '=== WORKSPACE ==='; ls -lah "$HOBBIT_WORKDIR" 2>/dev/null || true
+          } 2>&1 | tee "$CI_LOG_DIR/preflight.log"
 
-            echo "========== CPU =========="
-            lscpu
-            nproc
-
-            echo "========== MEMORY =========="
-            free -h
-            cat /proc/meminfo
-            cat /proc/swaps
-
-            echo "========== STORAGE =========="
-            df -h
-            df -i
-            lsblk
-
-            echo "========== LIMITS =========="
-            ulimit -a
-
-            echo "========== MEMORY PRESSURE =========="
-            cat /proc/pressure/memory || true
-
-            echo "========== OOM HISTORY =========="
-            sudo -n dmesg -T 2>/dev/null \
-              | grep -Ei 'out of memory|oom|killed process' \
-              | tail -60 || true
-
-            echo "========== COMPILERS =========="
-            gcc --version | head -1 || true
-            g++ --version | head -1 || true
-            cmake --version | head -1 || true
-            ninja --version || true
-            python3 --version || true
-
-            echo "========== NETWORK =========="
-            ip -brief address || true
-            ip route || true
-          } 2>&1 | tee "$CI_LOG_DIR/system.log"
-
-      - name: 04 - Verify installation script
+      - name: 03 - Materialize embedded original installer and test harness
         run: |
           set -Eeuo pipefail
+          mkdir -p "$CI_LOG_DIR"
+          cat > "$CI_LOG_DIR/hobbit-installer.sh" <<'HOBBIT_INSTALLER_EMBEDDED_EOF'
+          #!/usr/bin/env bash
+          # HOBBIT LLVM/Clang: standalone downloader, builder, runtime builder, and smoke tests.
+          # Ubuntu 22.04/24.04 x86_64, ~1 GiB RAM. Re-running resumes the Ninja build.
+          set -Eeuo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          umask 022
+          
+          ROOT="${HOBBIT_WORKDIR:-$HOME/hobbit-work}"
+          BRANCH="${HOBBIT_BRANCH:-hashes/blake3}"
+          ZIP="${HOBBIT_ZIP:-$HOME/hobbit-artifact.zip}"
+          SRC="$ROOT/src"
+          BUILD="$ROOT/build"
+          LOG="$ROOT/logs"
+          RTBUILD="$ROOT/runtime"
+          TESTS="$ROOT/tests"
+          JOBS="${HOBBIT_JOBS:-1}"
+          SWAP_GB="${HOBBIT_SWAP_GB:-8}"
+          RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+          mkdir -p "$LOG" "$ROOT" "$RTBUILD" "$TESTS"
+          SESSION="$LOG/session-$RUN_ID.log"
+          exec > >(tee -a "$SESSION" "$LOG/session-latest.log") 2>&1
+          trap 'rc=$?; printf "\n[FAIL] line=%s exit=%s command=%s\n" "$LINENO" "$rc" "$BASH_COMMAND"; echo "[FAIL] Logs: '"$SESSION"'"; exit "$rc"' ERR
+          
+          msg() { printf '\n%s\n' '========================================================================'; printf '[%s] %s\n' "$(date -Is)" "$*"; printf '%s\n' '========================================================================'; }
+          run() { printf '[COMMAND]'; printf ' %q' "$@"; printf '\n'; "$@"; }
+          status() { printf '[STATUS] %s\n' "$*"; }
+          diagnostics() {
+            msg "Machine diagnostics"
+            date -Is
+            uname -a
+            grep -E '^(NAME|VERSION|PRETTY_NAME)=' /etc/os-release || true
+            id
+            pwd
+            free -h
+            swapon --show || true
+            df -h / "$ROOT"
+            df -i "$ROOT"
+            nproc
+            command -v gcc && gcc --version | head -1 || true
+            command -v cmake && cmake --version | head -1 || true
+            command -v ninja && ninja --version || true
+          }
+          diagnostics
+          [[ "$(uname -m)" == x86_64 ]] || { echo "This script targets x86_64 only"; exit 2; }
+          [[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || { echo "HOBBIT_JOBS must be positive integer"; exit 2; }
+          [[ "$SWAP_GB" =~ ^[1-9][0-9]*$ ]] || { echo "HOBBIT_SWAP_GB must be positive integer"; exit 2; }
+          if [[ "$EUID" == 0 ]]; then SUDO=(); else SUDO=(sudo); fi
+          
+          msg "Step 1: Install all dependencies"
+          run "${SUDO[@]}" apt-get update
+          run "${SUDO[@]}" apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build python3 git unzip wget curl ca-certificates \
+            zlib1g-dev libzstd-dev libxml2-dev libedit-dev libncurses-dev \
+            binutils pkg-config file time
+          
+          msg "Step 2: Ensure sufficient swap without touching existing swap"
+          swap_kb="$(awk '/SwapTotal:/ {print $2}' /proc/meminfo)"
+          required_kb="$((SWAP_GB * 1024 * 1024))"
+          if (( swap_kb < required_kb )); then
+            add_kb="$((required_kb - swap_kb))"
+            add_mb="$(((add_kb + 1023) / 1024))"
+            SWAP_PATH="/swapfile-hobbit"
+            status "Current swap ${swap_kb} KiB; adding approximately ${add_mb} MiB at $SWAP_PATH"
+            if [[ ! -e "$SWAP_PATH" ]]; then
+              available_kb="$(df -Pk / | awk 'END {print $4}')"
+              if (( available_kb < add_kb + 2*1024*1024 )); then
+                echo "Insufficient disk for new swap plus 2 GiB reserve"; exit 3
+              fi
+              run "${SUDO[@]}" fallocate -l "${add_mb}M" "$SWAP_PATH"
+              run "${SUDO[@]}" chmod 600 "$SWAP_PATH"
+              run "${SUDO[@]}" mkswap "$SWAP_PATH"
+            fi
+            if ! swapon --noheadings --show=NAME | grep -Fxq "$SWAP_PATH"; then
+              run "${SUDO[@]}" swapon "$SWAP_PATH"
+            fi
+            if ! grep -Eq '^[[:space:]]*/swapfile-hobbit[[:space:]]' /etc/fstab; then
+              echo '/swapfile-hobbit none swap sw 0 0' | run "${SUDO[@]}" tee -a /etc/fstab
+            fi
+          else
+            status "Existing swap sufficient; no changes"
+          fi
+          free -h
+          swapon --show
+          run "${SUDO[@]}" sysctl -w vm.swappiness=80
+          
+          msg "Step 3: Acquire source (reuse existing valid ZIP, else download exact branch)"
+          if [[ -f "$SRC/llvm/CMakeLists.txt" && -f "$SRC/clang/CMakeLists.txt" ]]; then
+            status "Existing extracted source is valid: $SRC"
+          else
+            if [[ -s "$ZIP" ]] && unzip -tq "$ZIP" >"$LOG/zip-verify.log" 2>&1; then
+              status "Existing ZIP is valid: $ZIP"
+            else
+              status "ZIP absent or invalid; fetching $BRANCH from GitHub"
+              mkdir -p "$(dirname "$ZIP")"
+              # Branch name has slash; codeload's refs/heads form supports this.
+              URL="https://codeload.github.com/mbernad/hobbit-artifact/zip/refs/heads/$BRANCH"
+              run curl -fL --retry 5 --retry-delay 5 --connect-timeout 30 \
+                --progress-bar "$URL" -o "$ZIP.partial"
+              mv "$ZIP.partial" "$ZIP"
+              run unzip -tq "$ZIP" >"$LOG/zip-verify.log"
+            fi
+            status "ZIP size: $(du -h "$ZIP")"
+            status "ZIP root entries:"
+            unzip -Z1 "$ZIP" | head -20 || true
+            msg "Step 4: Extract archive once (this may take time and several GiB)"
+            EXTRACT="$ROOT/unpacked"
+            mkdir -p "$EXTRACT"
+            run unzip -q -n "$ZIP" -d "$EXTRACT"
+            FOUND="$(find "$EXTRACT" -maxdepth 6 -type f -path '*/llvm/CMakeLists.txt' -print -quit)"
+            [[ -n "$FOUND" ]] || { echo "Cannot find llvm/CMakeLists.txt after extraction"; find "$EXTRACT" -maxdepth 3 -type d | head -40; exit 4; }
+            PROJECT_ROOT="$(dirname "$(dirname "$FOUND")")"
+            [[ -f "$PROJECT_ROOT/clang/CMakeLists.txt" ]] || { echo "Clang source missing at $PROJECT_ROOT"; exit 4; }
+            if [[ ! -e "$SRC" ]]; then
+              run mv "$PROJECT_ROOT" "$SRC"
+            elif [[ -f "$SRC/llvm/CMakeLists.txt" ]]; then
+              status "Existing source already present; retaining it"
+            else
+              echo "Incomplete source directory at $SRC; refusing to overwrite"; exit 4
+            fi
+          fi
+          status "Source: $SRC"
+          status "Compiler modifications:"
+          ls -l "$SRC/clang/lib/CodeGen/UCSRLCoop.cpp" "$SRC/compiler-rt/lib/ucsrl_coop/coop_hash.c" || true
+          df -h "$ROOT"
+          
+          msg "Step 5: Configure memory-constrained LLVM+Clang build"
+          # Host -O0 reduces compiler RAM usage. X86-only, no debug symbols, no tests.
+          # Avoid expensive whole-project builds and concurrent links.
+          run cmake -S "$SRC/llvm" -B "$BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            '-DCMAKE_C_FLAGS_RELEASE=-O0 -DNDEBUG' \
+            '-DCMAKE_CXX_FLAGS_RELEASE=-O0 -DNDEBUG' \
+            '-DCMAKE_EXE_LINKER_FLAGS=-Wl,--no-keep-memory' \
+            -DLLVM_ENABLE_PROJECTS=clang \
+            -DLLVM_TARGETS_TO_BUILD=X86 \
+            -DLLVM_ENABLE_ASSERTIONS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_BUILD_DOCS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBEDIT=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_PARALLEL_COMPILE_JOBS=1 \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DCLANG_INCLUDE_TESTS=OFF \
+            2>&1 | tee -a "$LOG/cmake.log"
+          
+          msg "Step 6: Build custom Clang (may take many hours on 1 GiB RAM)"
+          status "Resumable: Ctrl-C, reboot, or disconnect; rerun this same script"
+          status "Ninja parallel jobs: $JOBS"
+          status "Build progress is streamed into $LOG/ninja.log"
+          set +e
+          cmake --build "$BUILD" --target clang --parallel "$JOBS" --verbose \
+            2>&1 | tee -a "$LOG/ninja.log"
+          build_rc="${PIPESTATUS[0]}"
+          set -e
+          if (( build_rc != 0 )); then
+            status "Build failed (exit $build_rc). Recent Ninja output:"
+            tail -100 "$LOG/ninja.log"
+            exit "$build_rc"
+          fi
+          CUSTOM="$BUILD/bin/clang++"
+          [[ -x "$CUSTOM" ]] || { echo "clang++ executable missing"; exit 5; }
+          run "$CUSTOM" --version
+          run "$CUSTOM" -print-resource-dir
+          
+          msg "Step 7: Build HOBBIT BLAKE3 hash runtime from included sources"
+          RT="$SRC/compiler-rt/lib/ucsrl_coop"
+          [[ -f "$RT/coop_hash.c" && -f "$RT/blake3/blake3.c" ]] || { echo "HOBBIT runtime sources missing"; exit 6; }
+          # Dispatch built without SIMD backends; portable implementation used.
+          COMMON=(-O2 -fPIC -DBLAKE3_NO_SSE2 -DBLAKE3_NO_SSE41 -DBLAKE3_NO_AVX2 -DBLAKE3_NO_AVX512 "-I$RT/blake3" "-I$RT")
+          for name in blake3 blake3_dispatch blake3_portable; do
+            run gcc "${COMMON[@]}" -c "$RT/blake3/$name.c" -o "$RTBUILD/$name.o"
+          done
+          run gcc "${COMMON[@]}" -c "$RT/coop_hash.c" -o "$RTBUILD/coop_hash.o"
+          run ar rcs "$RTBUILD/libclang_rt.coop_hash-x86_64.a" \
+            "$RTBUILD/blake3.o" "$RTBUILD/blake3_dispatch.o" \
+            "$RTBUILD/blake3_portable.o" "$RTBUILD/coop_hash.o"
+          run nm -g "$RTBUILD/libclang_rt.coop_hash-x86_64.a" | grep -E 'ucsrl_coop_hash|blake3_hasher' || true
+          RESOURCE="$("$CUSTOM" -print-resource-dir)"
+          run mkdir -p "$RESOURCE/lib/linux"
+          run cp "$RTBUILD/libclang_rt.coop_hash-x86_64.a" "$RESOURCE/lib/linux/"
+          # Driver may use a different resource name/ABI: record it for diagnosis.
+          run "$CUSTOM" -### -x c++ - -o /tmp/hobbit-driver-probe </dev/null \
+            2>&1 | tee "$LOG/driver-link-command.log" || true
+          
+          
+          msg "Step 8: Build an expanded self-contained evaluation harness"
+          # Test cases are separate processes, with explicit expected behavior.
+          # Some corruption cases use intentional undefined behavior; they are probes,
+          # not proof of real-world exploit mitigation.
+          cat > "$TESTS/hobbit_cases.cpp" <<'CPP'
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <cstdint>
+          #include <new>
+          #include <memory>
+          #include <utility>
+          #include <vector>
+          struct A {
+            virtual int f() { return 41; }
+            virtual int g() { return 42; }
+            virtual ~A() {}
+          };
+          struct B: A { int f() override { return 51; } int g() override { return 52; } };
+          struct C: A { int f() override { return 61; } };
+          struct L { virtual int left() { return 70; } virtual ~L(){} };
+          struct R { virtual int right() { return 80; } virtual ~R(){} };
+          struct M: L, R { int left() override { return 71; } int right() override { return 81; } };
+          struct V: virtual A { int f() override { return 91; } };
+          extern "C" __attribute__((noinline)) int unexpected(A*) {
+            std::puts("ATTACK_TARGET_REACHED"); std::fflush(stdout); return 99;
+          }
+          __attribute__((noinline)) int call_f(A* p) { return p->f(); }
+          __attribute__((noinline)) int call_g(A* p) { return p->g(); }
+          __attribute__((noinline)) int call_l(L* p) { return p->left(); }
+          __attribute__((noinline)) int call_r(R* p) { return p->right(); }
+          static int ok(bool value, const char* tag) {
+            std::printf("RESULT %s %s\n", tag, value?"PASS":"FAIL"); return value?0:3;
+          }
+          static void* get_vptr(void* p) { void* v=nullptr; std::memcpy(&v,p,sizeof(v)); return v; }
+          static void put_vptr(void* p,void* v) { std::memcpy(p,&v,sizeof(v)); }
+          int main(int argc,char** argv) {
+            if(argc<2) return 64;
+            const char* t=argv[1];
+            std::printf("CASE=%s\n",t); std::fflush(stdout);
+            if(!std::strcmp(t,"basic")) { A a; return ok(call_f(&a)==41 && call_g(&a)==42,t); }
+            if(!std::strcmp(t,"derived")) { B b; A* a=&b; return ok(call_f(a)==51 && call_g(a)==52,t); }
+            if(!std::strcmp(t,"derived2")) { C c; A* a=&c; return ok(call_f(a)==61 && call_g(a)==42,t); }
+            if(!std::strcmp(t,"multiple")) { M m; return ok(call_l(&m)==71 && call_r(&m)==81,t); }
+            if(!std::strcmp(t,"virtualbase")) { V v; A* a=&v; return ok(call_f(a)==91,t); }
+            if(!std::strcmp(t,"heap")) { std::unique_ptr<A> a(new B); return ok(call_f(a.get())==51,t); }
+            if(!std::strcmp(t,"array")) { B a[4]; int sum=0; for(auto& e:a)sum+=call_f(&e); return ok(sum==204,t); }
+            if(!std::strcmp(t,"placement")) {
+              alignas(B) unsigned char bytes[sizeof(B)]; B* p=new(bytes) B;
+              bool pass=call_f(p)==51; p->~B(); return ok(pass,t);
+            }
+            if(!std::strcmp(t,"copy")) { B b; B b2=b; return ok(call_f(&b2)==51,t); }
+            if(!std::strcmp(t,"move")) { B b; B b2=std::move(b); return ok(call_f(&b2)==51,t); }
+            if(!std::strcmp(t,"vector")) {
+              std::vector<B> v(4); int sum=0; for(auto& e:v)sum+=call_f(&e);
+              return ok(sum==204,t);
+            }
+            if(!std::strcmp(t,"null_vptr")) {
+              A a; put_vptr(&a,nullptr); std::puts("CORRUPTED"); std::fflush(stdout);
+              int x=call_f(&a); std::printf("DISPATCH_RETURNED=%d\n",x); return 0;
+            }
+            if(!std::strcmp(t,"swap_vptr")) {
+              A a; B b; put_vptr(&a,get_vptr(&b)); std::puts("CORRUPTED"); std::fflush(stdout);
+              int x=call_f(&a); std::printf("DISPATCH_RETURNED=%d\n",x); return 0;
+            }
+            if(!std::strcmp(t,"copy_object_vptr")) {
+              A a; A b; put_vptr(&a,get_vptr(&b)); std::puts("CORRUPTED"); std::fflush(stdout);
+              int x=call_f(&a); std::printf("DISPATCH_RETURNED=%d\n",x); return 0;
+            }
+            if(!std::strcmp(t,"fake_vtable")) {
+              A a; void* fake[]={reinterpret_cast<void*>(&unexpected),reinterpret_cast<void*>(&unexpected)};
+              put_vptr(&a,fake); std::puts("CORRUPTED"); std::fflush(stdout);
+              int x=call_f(&a); std::printf("DISPATCH_RETURNED=%d\n",x); return 0;
+            }
+            if(!std::strcmp(t,"flip_vptr_bit")) {
+              A a; auto v=reinterpret_cast<uintptr_t>(get_vptr(&a));
+              put_vptr(&a,reinterpret_cast<void*>(v ^ uintptr_t(1)));
+              std::puts("CORRUPTED"); std::fflush(stdout);
+              int x=call_f(&a); std::printf("DISPATCH_RETURNED=%d\n",x); return 0;
+            }
+            if(!std::strcmp(t,"flip_signature_candidate")) {
+              A a; // A deliberately exploratory probe: offset is NOT verified.
+              // Do not modify arbitrary object memory here; report as skipped.
+              std::puts("SKIP signature layout offset not independently verified"); return 77;
+            }
+            std::fprintf(stderr,"Unknown test %s\n",t); return 64;
+          }
+          CPP
+          cat > "$TESTS/hash_check.c" <<'C'
+          #include <stdio.h>
+          #include <stdint.h>
+          extern long ucsrl_coop_hash(long);
+          int main(void) {
+            long a=ucsrl_coop_hash(0x12345678);
+            long b=ucsrl_coop_hash(0x12345678);
+            long c=ucsrl_coop_hash(0x12345679);
+            printf("HASH equal=%d different=%d a=%016lx b=%016lx c=%016lx\n",
+              a==b,a!=c,(unsigned long)a,(unsigned long)b,(unsigned long)c);
+            return (a==b && a!=c)?0:1;
+          }
+          C
+          cat > "$TESTS/evaluate.py" <<'PY'
+          #!/usr/bin/env python3
+          import csv, json, os, pathlib, re, subprocess, sys, time, hashlib
+          root=pathlib.Path(sys.argv[1]); clang=sys.argv[2]
+          tests=root/"tests"; logs=root/"logs"; runtime=root/"runtime"
+          logs.mkdir(exist_ok=True)
+          cases={
+           "basic":"valid","derived":"valid","derived2":"valid",
+           "multiple":"valid","virtualbase":"valid","heap":"valid",
+           "array":"valid","placement":"valid","copy":"valid",
+           "move":"valid","vector":"valid",
+           "null_vptr":"attack","swap_vptr":"attack",
+           "copy_object_vptr":"attack","fake_vtable":"attack",
+           "flip_vptr_bit":"attack","flip_signature_candidate":"exploratory"
+          }
+          results=[]
+          def record(name,variant,phase,rc,seconds,detail="",out=""):
+              row=dict(case=name,variant=variant,phase=phase,exit_code=rc,
+                       seconds=round(seconds,3),detail=detail,output=out[-500:])
+              results.append(row)
+              print("RESULT",json.dumps(row,sort_keys=True),flush=True)
+          def run(cmd,where,timeout=90):
+              print("EXEC",repr(cmd),"LOG",where,flush=True)
+              start=time.monotonic()
+              try:
+                  proc=subprocess.run(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                                      text=True,errors="replace",timeout=timeout,cwd=tests)
+                  output=proc.stdout; code=proc.returncode
+              except subprocess.TimeoutExpired as e:
+                  output=str(e.stdout or "")+"\nTIMEOUT";code=124
+              duration=time.monotonic()-start
+              pathlib.Path(where).write_text(output)
+              print("EXIT",code,"DURATION",round(duration,3),"OUTPUT:\n",output[-8000:],flush=True)
+              return code,output,duration
+          # A stock GCC control helps distinguish HOBBIT from ordinary crash behavior.
+          variants=[("gcc",["g++"]),("hobbit_O0",[clang]),("hobbit_O1",[clang]),("hobbit_O2",[clang])]
+          for variant,prefix in variants:
+              opt={"gcc":"-O0","hobbit_O0":"-O0","hobbit_O1":"-O1","hobbit_O2":"-O2"}[variant]
+              exe=tests/("cases_"+variant)
+              cmd=prefix+[opt,"-g0","-fno-inline","-fno-pie","-no-pie",
+                           str(tests/"hobbit_cases.cpp"),"-o",str(exe)]
+              rc,out,dur=run(cmd,logs/(variant+".compile.log"),timeout=180)
+              record("suite",variant,"compile",rc,dur,"OK" if rc==0 else "COMPILE_FAILED",out)
+              if rc!=0: continue
+              for case,kind in cases.items():
+                  rc,out,dur=run([str(exe),case],logs/(variant+"."+case+".run.log"),timeout=12)
+                  if kind=="valid":
+                      classification="PASS" if rc==0 and "RESULT "+case+" PASS" in out else "FAIL"
+                  elif kind=="exploratory":
+                      classification="SKIP" if rc==77 else "INCONCLUSIVE"
+                  else:
+                      if "ATTACK_TARGET_REACHED" in out: classification="ATTACK_TARGET_REACHED"
+                      elif rc==147: classification="HOBBIT_EXIT_147"
+                      elif rc in (-11,139): classification="SEGFAULT_NOT_PROOF"
+                      elif rc in (-4,132): classification="ILLEGAL_INSTRUCTION"
+                      elif rc==124: classification="TIMEOUT"
+                      elif "DISPATCH_RETURNED" in out: classification="DISPATCH_RETURNED"
+                      else: classification="OTHER_NONZERO_OR_TERMINATION"
+                  record(case,variant,"run",rc,dur,classification,out)
+          # Check IR for HOBBIT signature calls, guard, mismatch exit.
+          for opt in ("-O0","-O1","-O2"):
+              outfile=logs/("hobbit"+opt+".ll")
+              cmd=[clang,opt,"-S","-emit-llvm","-fno-inline",
+                   str(tests/"hobbit_cases.cpp"),"-o",str(outfile)]
+              rc,out,dur=run(cmd,logs/("ir"+opt+".compile.log"),timeout=180)
+              if rc==0:
+                  ir=outfile.read_text(errors="replace")
+                  metrics={x:ir.count(x) for x in ("ucsrl_coop_hash","coop.compare",
+                          "CoopSignatureMismatch","exit(i64 147)","ucsrl.virtual.function_mark")}
+                  record("IR_"+opt,"hobbit","inspect",0,dur,json.dumps(metrics))
+                  print("IR_METRICS",opt,metrics,flush=True)
+              else: record("IR_"+opt,"hobbit","inspect",rc,dur,"IR_FAILED",out)
+          # Runtime hash determinism and input sensitivity.
+          hashbin=tests/"hash_check"
+          rtlib=runtime/"libclang_rt.coop_hash-x86_64.a"
+          rc,out,dur=run(["gcc",str(tests/"hash_check.c"),str(rtlib),"-o",str(hashbin)],
+                         logs/"hash.compile.log",timeout=60)
+          record("hash","runtime","compile",rc,dur,"OK" if rc==0 else "FAIL",out)
+          if rc==0:
+              rc,out,dur=run([str(hashbin)],logs/"hash.run.log",timeout=15)
+              record("hash","runtime","run",rc,dur,"PASS" if rc==0 else "FAIL",out)
+          # Output full machine-readable report and a brief summary.
+          with (root/"results.csv").open("w",newline="") as f:
+              w=csv.DictWriter(f,fieldnames=["case","variant","phase","exit_code","seconds","detail","output"])
+              w.writeheader();w.writerows(results)
+          (root/"results.json").write_text(json.dumps(results,indent=2))
+          valid=[x for x in results if x["phase"]=="run" and x["case"] in cases and cases[x["case"]]=="valid"]
+          attack=[x for x in results if x["phase"]=="run" and x["case"] in cases and cases[x["case"]]=="attack"]
+          lines=[
+           "HOBBIT evaluation report",
+           "========================",
+           "IMPORTANT: Undefined-behavior probes are not a formal COOP exploit benchmark.",
+           "A segmentation fault is NOT evidence of HOBBIT enforcement.",
+           "Exit 147 is consistent with the checked source's mismatch exit,",
+           "but needs inspection of binary/IR and comparison against GCC.",
+           "",
+           f"Valid functional test passes: {sum(x['detail']=='PASS' for x in valid)}/{len(valid)}",
+           f"Corruption probe outcomes: {len(attack)} runs",
+          ]
+          for x in attack:lines.append(f"  {x['variant']:12} {x['case']:20} {x['detail']:30} exit={x['exit_code']}")
+          lines += ["", "Artifacts: results.csv, results.json, logs/*.log, logs/*.ll"]
+          (root/"REPORT.txt").write_text("\n".join(lines)+"\n")
+          print("\n".join(lines),flush=True)
+          PY
+          chmod +x "$TESTS/evaluate.py"
+          
+          msg "Step 9: Run all test cases across GCC, HOBBIT -O0, -O1, -O2"
+          # The test runner records per-case failures and keeps going.
+          # Some experimental compiler variants may fail to compile.
+          run python3 -u "$TESTS/evaluate.py" "$ROOT" "$CUSTOM" \
+            2>&1 | tee -a "$LOG/evaluation.log"
+          
+          msg "Step 10: Additional build diagnostics and final report"
+          run "$CUSTOM" -v
+          run "$CUSTOM" -print-resource-dir
+          run sha256sum "$CUSTOM" "$RTBUILD/libclang_rt.coop_hash-x86_64.a"
+          run df -h "$ROOT"
+          run free -h
+          run cat "$ROOT/REPORT.txt"
+          
+          # Print an unmistakable, self-contained console summary, even when the
+          # detailed evaluation output has scrolled off the screen.
+          msg "FINAL CONSOLE SUMMARY - HOBBIT BUILD AND TEST RESULTS"
+          python3 - "$ROOT/results.json" <<'PY_SUMMARY'
+          import collections, json, sys
+          from pathlib import Path
+          p = Path(sys.argv[1])
+          if not p.exists():
+              print("NO TEST RESULTS FOUND - evaluation did not complete")
+              sys.exit(0)
+          rows = json.loads(p.read_text())
+          valid_names = {"basic", "derived", "derived2", "multiple", "virtualbase",
+                         "heap", "array", "placement", "copy", "move", "vector"}
+          attack_names = {"null_vptr", "swap_vptr", "copy_object_vptr",
+                          "fake_vtable", "flip_vptr_bit"}
+          print("=" * 92)
+          print("HOBBIT: FINAL TEST RESULTS (PER COMPILER CONFIGURATION)")
+          print("=" * 92)
+          print(f"{'CONFIGURATION':<17} {'VALID PASS':>12} {'VALID FAIL':>12} {'ATTACK PROBES':>16} {'OBSERVED OUTCOMES'}")
+          print("-" * 92)
+          for variant in ("gcc", "hobbit_O0", "hobbit_O1", "hobbit_O2"):
+              comp = [r for r in rows if r['variant'] == variant and r['phase'] == 'compile' and r['case'] == 'suite']
+              if not comp or comp[0]['exit_code'] != 0:
+                  print(f"{variant:<17} {'N/A':>12} {'N/A':>12} {'N/A':>16} COMPILE FAILED / NOT RUN")
+                  continue
+              v = [r for r in rows if r['variant'] == variant and r['phase'] == 'run' and r['case'] in valid_names]
+              a = [r for r in rows if r['variant'] == variant and r['phase'] == 'run' and r['case'] in attack_names]
+              passed = sum(r['detail'] == 'PASS' for r in v)
+              outcomes = collections.Counter(r['detail'] for r in a)
+              text = ', '.join(f"{k}:{n}" for k, n in sorted(outcomes.items())) or 'none'
+              print(f"{variant:<17} {passed:>9}/{len(v):<2} {len(v)-passed:>12} {len(a):>16} {text}")
+          print("-" * 92)
+          print("DETAILED CORRUPTION PROBE RESULTS:")
+          print(f"{'CONFIGURATION':<17} {'TEST':<24} {'EXIT':>6}  CLASSIFICATION")
+          for r in rows:
+              if r['phase'] == 'run' and r['case'] in attack_names:
+                  print(f"{r['variant']:<17} {r['case']:<24} {str(r['exit_code']):>6}  {r['detail']}")
+          print("-" * 92)
+          for r in rows:
+              if r['case'] == 'hash' and r['phase'] == 'run':
+                  print("HASH RUNTIME TEST:", r['detail'])
+          print("INTERPRETATION: A crash alone does not prove HOBBIT enforcement.")
+          print("The listed corruption tests are probes, not a comprehensive COOP benchmark.")
+          print("FULL REPORT:", p.parent / 'REPORT.txt')
+          print("CSV RESULTS:", p.parent / 'results.csv')
+          print("=" * 92)
+          PY_SUMMARY
+          status "All stages finished; inspect failed/ambiguous test cases"
+          status "Summary: $ROOT/REPORT.txt"
+          status "Machine readable: $ROOT/results.csv and $ROOT/results.json"
+          status "Evaluation transcript: $LOG/evaluation.log"
+          status "Full session: $SESSION"
+          status "Compiler: $CUSTOM"
+          status "This harness evaluates several representative behaviors, not every possible COOP attack."
+          HOBBIT_INSTALLER_EMBEDDED_EOF
+          chmod 700 "$CI_LOG_DIR/hobbit-installer.sh"
+          bash -n "$CI_LOG_DIR/hobbit-installer.sh"
+          echo 'Embedded installer syntax: PASS'
+          sha256sum "$CI_LOG_DIR/hobbit-installer.sh"
+          wc -lc "$CI_LOG_DIR/hobbit-installer.sh"
+          echo 'No repository installer file is required.'
 
-          test -f "$HOBBIT_SCRIPT"
-          bash -n "$HOBBIT_SCRIPT"
-
-          echo "Script SHA256:"
-          sha256sum "$HOBBIT_SCRIPT"
-
-          echo "Script size:"
-          wc -lc "$HOBBIT_SCRIPT"
-
-          echo "Script syntax: PASS"
-
-      - name: 05 - Run HOBBIT installation and tests
-        id: install
+      - name: 04 - Execute full build and evaluation with live log streaming
+        id: installer
         continue-on-error: true
         run: |
           set -uo pipefail
-
-          echo "========================================"
-          echo "HOBBIT FULL INSTALLATION START"
-          echo "========================================"
+          echo '================ HOBBIT BUILD START ================'
+          echo "Started: $(date -Is)"
           echo "Workdir: $HOBBIT_WORKDIR"
-          echo "Parallel jobs: $HOBBIT_JOBS"
-          echo "Swap target: ${HOBBIT_SWAP_GB} GiB"
-          echo "Start: $(date -Is)"
+          echo "Build jobs: $HOBBIT_JOBS; requested swap: $HOBBIT_SWAP_GB GiB"
+          start=$(date +%s)
+          bash "$CI_LOG_DIR/hobbit-installer.sh" 2>&1 | tee "$CI_LOG_DIR/installer-console.log"
+          rc=${PIPESTATUS[0]}
+          echo "$rc" > "$CI_LOG_DIR/installer.exit"
+          echo "$(($(date +%s)-start))" > "$CI_LOG_DIR/installer.duration-seconds"
+          echo "Installer exit code: $rc"
+          exit "$rc"
 
-          START=$(date +%s)
-
-          # Bash xtrace provides additional command diagnostics.
-          # Do not enable this for scripts containing secrets.
-          export PS4='+ ${BASH_SOURCE}:${LINENO}: '
-
-          bash -x "$HOBBIT_SCRIPT" \
-            2>&1 | tee "$CI_LOG_DIR/install.log"
-
-          RC=${PIPESTATUS[0]}
-          END=$(date +%s)
-
-          echo "$RC" > "$CI_LOG_DIR/install.exit"
-          echo "$((END - START))" \
-            > "$CI_LOG_DIR/install.seconds"
-
-          echo "========================================"
-          echo "INSTALLATION EXIT CODE: $RC"
-          echo "DURATION SECONDS: $((END - START))"
-          echo "========================================"
-
-          exit "$RC"
-
-      - name: 06 - Verify compiler and runtime
+      - name: 05 - Independent post-run evaluation and log classification
         if: always()
         run: |
-          {
-            echo "========== BUILD ARTIFACTS =========="
-
-            CLANG="$HOBBIT_WORKDIR/build/bin/clang++"
-
-            if [[ -x "$CLANG" ]]; then
-              echo "Compiler executable: PRESENT"
-              "$CLANG" --version
-              "$CLANG" -print-resource-dir
-              sha256sum "$CLANG"
-              file "$CLANG"
-              ldd "$CLANG" || true
-            else
-              echo "Compiler executable: MISSING"
-            fi
-
-            echo "========== RUNTIME =========="
-
-            RT="$HOBBIT_WORKDIR/runtime"
-            if [[ -d "$RT" ]]; then
-              find "$RT" -maxdepth 2 -type f \
-                -printf '%p %s bytes\n'
-            else
-              echo "Runtime directory: MISSING"
-            fi
-
-            echo "========== REPORT FILES =========="
-
-            for f in \
-              "$HOBBIT_WORKDIR/REPORT.txt" \
-              "$HOBBIT_WORKDIR/results.json" \
-              "$HOBBIT_WORKDIR/results.csv"; do
-              if [[ -f "$f" ]]; then
-                ls -lh "$f"
-              else
-                echo "MISSING: $f"
-              fi
-            done
-
-          } 2>&1 | tee "$CI_LOG_DIR/verification.log"
-
-      - name: 07 - Analyze tests and log failures
-        if: always()
-        run: |
-          python3 - "$HOBBIT_WORKDIR" "$CI_LOG_DIR" <<'PY'
-          import collections
-          import json
-          import pathlib
-          import re
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          ci = pathlib.Path(sys.argv[2])
-          rows_path = root / "results.json"
-          install_log = ci / "install.log"
-
-          lines = []
-          def emit(s=""):
-              print(s, flush=True)
-              lines.append(s)
-
-          emit("=" * 90)
-          emit("HOBBIT ULTRA-VERBOSE TEST ANALYSIS")
-          emit("=" * 90)
-
-          if rows_path.exists():
-              rows = json.loads(rows_path.read_text())
-              emit(f"Recorded test events: {len(rows)}")
-
-              for variant in (
-                  "gcc", "hobbit_O0",
-                  "hobbit_O1", "hobbit_O2"
-              ):
-                  emit("")
-                  emit(f"CONFIGURATION: {variant}")
-                  emit("-" * 70)
-
-                  subset = [
-                      r for r in rows
-                      if r.get("variant") == variant
-                  ]
-
-                  for r in subset:
-                      emit(
-                          f"{r.get('phase','?'):8} "
-                          f"{r.get('case','?'):25} "
-                          f"exit={str(r.get('exit_code','?')):5} "
-                          f"time={str(r.get('seconds','?')):8} "
-                          f"{r.get('detail','')}"
-                      )
-
-                  counts = collections.Counter(
-                      r.get("detail")
-                      for r in subset
-                      if r.get("phase") == "run"
-                  )
-                  emit(f"Outcome counts: {dict(counts)}")
-
-              emit("")
-              emit("COMPILATION FAILURES:")
-              failures = [
-                  r for r in rows
-                  if r.get("phase") == "compile"
-                  and r.get("exit_code") != 0
-              ]
-              if failures:
-                  for r in failures:
-                      emit(
-                          f"{r.get('variant')} "
-                          f"{r.get('case')}: "
-                          f"{r.get('output','')[-1000:]}"
-                      )
-              else:
-                  emit("None recorded")
-
+          python3 - "$HOBBIT_WORKDIR" "$CI_LOG_DIR" <<'PY_ANALYZE'
+          import collections, json, pathlib, re, sys
+          root, ci = map(pathlib.Path, sys.argv[1:])
+          ci.mkdir(parents=True, exist_ok=True)
+          lines=[]
+          def p(*args):
+              s=' '.join(map(str,args)); print(s,flush=True); lines.append(s)
+          p('='*100)
+          p('HOBBIT ORACLE - ULTRA VERBOSE FINAL CONSOLE SUMMARY')
+          p('='*100)
+          exitfile=ci/'installer.exit'
+          p('Installer exit:', exitfile.read_text().strip() if exitfile.exists() else 'NOT RECORDED')
+          duration=ci/'installer.duration-seconds'
+          p('Elapsed seconds:', duration.read_text().strip() if duration.exists() else 'UNKNOWN')
+          compiler=root/'build/bin/clang++'
+          p('Clang++:', 'PRESENT' if compiler.is_file() else 'MISSING')
+          results=root/'results.json'
+          valid={'basic','derived','derived2','multiple','virtualbase','heap','array','placement','copy','move','vector'}
+          attacks={'null_vptr','swap_vptr','copy_object_vptr','fake_vtable','flip_vptr_bit'}
+          problems=[]
+          if not exitfile.exists() or exitfile.read_text().strip()!='0': problems.append('Installer failed or did not finish')
+          if not compiler.is_file(): problems.append('Compiler binary missing')
+          if not results.exists():
+              problems.append('results.json missing: test harness did not finish')
+              p('NO RESULTS FILE - build or evaluation stopped before results were written')
           else:
-              emit("NO RESULTS.JSON FOUND")
-              emit("Installation/build may have failed before tests.")
+              try: rows=json.loads(results.read_text())
+              except Exception as e:
+                  rows=[]; problems.append('Invalid results.json: '+str(e))
+              p('TOTAL RESULT RECORDS:',len(rows))
+              for variant in ('gcc','hobbit_O0','hobbit_O1','hobbit_O2'):
+                  p('\n'+'-'*95)
+                  p('COMPILER CONFIGURATION:',variant)
+                  subset=[r for r in rows if r.get('variant')==variant]
+                  comp=[r for r in subset if r.get('case')=='suite' and r.get('phase')=='compile']
+                  if not comp or comp[0].get('exit_code')!=0: problems.append(variant+': compilation failed or missing')
+                  vr=[r for r in subset if r.get('phase')=='run' and r.get('case') in valid]
+                  passed={r['case'] for r in vr if r.get('detail')=='PASS'}
+                  missing=valid-passed
+                  p('VALID FUNCTIONAL PASSES:',len(passed),'/',len(valid))
+                  if missing: problems.append(variant+': functional tests failed/missing: '+', '.join(sorted(missing)))
+                  for r in subset:
+                      p('CASE:',r.get('case'),'PHASE:',r.get('phase'),'EXIT:',r.get('exit_code'),'SECONDS:',r.get('seconds'),'CLASS:',r.get('detail'))
+                  a=[r for r in subset if r.get('phase')=='run' and r.get('case') in attacks]
+                  p('CORRUPTION PROBE OUTCOMES:',dict(collections.Counter(r.get('detail') for r in a)))
+              hashes=[r for r in rows if r.get('case')=='hash' and r.get('phase')=='run' and r.get('detail')=='PASS']
+              if not hashes: problems.append('Hash runtime test missing or failed')
+              for r in rows:
+                  if r.get('phase')=='inspect': p('LLVM IR:',r.get('case'),r.get('detail'))
+          log=ci/'installer-console.log'
+          if log.exists():
+              text=log.read_text(errors='replace')
+              p('\nLOG ANALYSIS (heuristic; not all matches indicate failures):')
+              for name,pattern in {'errors':r'error:|\[FAIL\]','warnings':r'warning:','oom':r'out of memory|killed process|oom.kill','timeouts':r'timeout','segfault':r'segmentation fault|segfault'}.items():
+                  p(name.upper()+':',len(re.findall(pattern,text,re.I)))
+              p('\nLAST 70 IMPORTANT LINES:')
+              selected=[s for s in text.splitlines() if re.search(r'error:|warning:|fatal|failed|\[FAIL\]|out of memory|killed process|timeout',s,re.I)]
+              for s in selected[-70:]:p(s[:500])
+              p('\nLAST 60 INSTALLER LINES:')
+              for s in text.splitlines()[-60:]:p(s[:500])
+          p('\nIMPORTANT: A segmentation fault alone is not proof of HOBBIT protection.')
+          p('Corruption probes are exploratory and not a comprehensive security benchmark.')
+          p('\nFINAL REQUIRED-TEST VERDICT:', 'FAIL' if problems else 'PASS')
+          for issue in problems:p('FAIL:',issue)
+          (ci/'verdict.json').write_text(json.dumps({'passed':not problems,'problems':problems},indent=2))
+          (ci/'console-summary.txt').write_text('\n'.join(lines)+'\n')
+          PY_ANALYZE
 
-          if install_log.exists():
-              text = install_log.read_text(errors="replace")
-              patterns = {
-                  "errors": r"\berror:",
-                  "warnings": r"\bwarning:",
-                  "fatal": r"\bfatal\b",
-                  "oom": r"out of memory|oom.kill|killed process",
-                  "segfault": r"segmentation fault|segfault",
-                  "timeouts": r"\btimeout\b",
-                  "failed": r"\bfailed\b",
-              }
-
-              emit("")
-              emit("INSTALLATION LOG COUNTS:")
-              for name, pattern in patterns.items():
-                  count = len(re.findall(
-                      pattern, text, re.IGNORECASE
-                  ))
-                  emit(f"{name:16}: {count}")
-
-              emit("")
-              emit("LAST 60 IMPORTANT LOG LINES:")
-              important = [
-                  line for line in text.splitlines()
-                  if re.search(
-                      r"error:|fatal|failed|oom|"
-                      r"killed process|segfault|"
-                      r"\[FAIL\]|timeout",
-                      line, re.IGNORECASE
-                  )
-              ]
-              for line in important[-60:]:
-                  emit(line[:500])
-
-          (ci / "analysis-summary.txt").write_text(
-              "\n".join(lines) + "\n"
-          )
-          PY
-
-      - name: 08 - FINAL CONSOLE SUMMARY
+      - name: 06 - Print original report and diagnostics
         if: always()
         run: |
-          echo ""
-          echo "################################################"
-          echo "# HOBBIT ORACLE - FINAL CONSOLE SUMMARY"
-          echo "################################################"
+          echo '========== ORIGINAL HOBBIT REPORT =========='
+          if [[ -f "$HOBBIT_WORKDIR/REPORT.txt" ]]; then cat "$HOBBIT_WORKDIR/REPORT.txt"; else echo 'REPORT.txt NOT PRODUCED'; fi
+          echo '========== FINAL RESOURCE STATUS =========='
+          free -h; swapon --show || true; df -h "$HOBBIT_WORKDIR" || true
+          echo '========== OUTPUT FILES =========='
+          find "$HOBBIT_WORKDIR" -maxdepth 2 -type f \( -name '*.log' -o -name '*.json' -o -name '*.csv' -o -name 'REPORT.txt' \) -printf '%p (%s bytes)\n' 2>/dev/null | tail -150 || true
 
-          echo "Runner: $RUNNER_NAME"
-          echo "Run: $GITHUB_RUN_ID"
-          echo "Timestamp: $(date -Is)"
-
-          if [[ -f "$CI_LOG_DIR/install.exit" ]]; then
-            RC=$(cat "$CI_LOG_DIR/install.exit")
-            echo "Installer exit code: $RC"
-          else
-            echo "Installer exit code: NOT RECORDED"
-          fi
-
-          if [[ -f "$CI_LOG_DIR/install.seconds" ]]; then
-            SECONDS_USED=$(cat "$CI_LOG_DIR/install.seconds")
-            echo "Installation duration: ${SECONDS_USED}s"
-          fi
-
-          echo ""
-          echo "========== HOBBIT REPORT =========="
-          if [[ -f "$HOBBIT_WORKDIR/REPORT.txt" ]]; then
-            cat "$HOBBIT_WORKDIR/REPORT.txt"
-          else
-            echo "Report unavailable"
-          fi
-
-          echo ""
-          echo "========== TEST ANALYSIS =========="
-          if [[ -f "$CI_LOG_DIR/analysis-summary.txt" ]]; then
-            cat "$CI_LOG_DIR/analysis-summary.txt"
-          fi
-
-          echo ""
-          echo "========== LAST 100 INSTALL LOG LINES =========="
-          if [[ -f "$CI_LOG_DIR/install.log" ]]; then
-            tail -100 "$CI_LOG_DIR/install.log"
-          fi
-
-          echo ""
-          echo "========== FINAL MEMORY =========="
-          free -h
-          swapon --show || true
-          df -h "$HOBBIT_WORKDIR" || true
-
-          echo ""
-          echo "################################################"
-          echo "# END HOBBIT CONSOLE SUMMARY"
-          echo "################################################"
-
-      - name: 09 - Publish GitHub job summary
+      - name: 07 - Publish GitHub Actions run summary
         if: always()
         run: |
           {
-            echo "# HOBBIT Oracle Evaluation"
-            echo ""
+            echo '# HOBBIT Oracle self-contained evaluation'
             echo "**Runner:** $RUNNER_NAME"
-            echo ""
-            echo "**Installation step:** ${{ steps.install.outcome }}"
-            echo ""
-            echo "## Evaluation report"
+            echo "**Installer step:** ${{ steps.installer.outcome }}"
+            echo ''
+            echo '## Final report'
             echo '```text'
-            if [[ -f "$HOBBIT_WORKDIR/REPORT.txt" ]]; then
-              cat "$HOBBIT_WORKDIR/REPORT.txt"
-            else
-              echo "Report unavailable"
-            fi
+            if [[ -f "$CI_LOG_DIR/console-summary.txt" ]]; then tail -180 "$CI_LOG_DIR/console-summary.txt"; else echo 'No summary generated'; fi
             echo '```'
-            echo ""
-            echo "Full logs are available in workflow artifacts."
+            echo ''
+            echo 'Full logs and per-case results are in the uploaded artifact.'
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 10 - Collect logs
+      - name: 08 - Collect original per-case logs and reports
         if: always()
         run: |
           mkdir -p "$CI_LOG_DIR/collected"
-
-          if [[ -d "$HOBBIT_WORKDIR/logs" ]]; then
-            cp -a "$HOBBIT_WORKDIR/logs" \
-              "$CI_LOG_DIR/collected/" || true
-          fi
-
+          if [[ -d "$HOBBIT_WORKDIR/logs" ]]; then cp -a "$HOBBIT_WORKDIR/logs" "$CI_LOG_DIR/collected/" || true; fi
           for name in REPORT.txt results.json results.csv; do
-            if [[ -f "$HOBBIT_WORKDIR/$name" ]]; then
-              cp "$HOBBIT_WORKDIR/$name" \
-                "$CI_LOG_DIR/collected/" || true
-            fi
+            if [[ -f "$HOBBIT_WORKDIR/$name" ]]; then cp "$HOBBIT_WORKDIR/$name" "$CI_LOG_DIR/collected/" || true; fi
           done
 
-      - name: 11 - Upload diagnostic artifacts
+      - name: 09 - Upload every diagnostic and evaluation artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hobbit-oracle-logs-${{ github.run_id }}
-          path: ${{ runner.temp }}/hobbit-ci/
+          name: hobbit-oracle-ultra-${{ github.run_id }}
+          path: ${{ runner.temp }}/hobbit-ci-${{ github.run_id }}/
           if-no-files-found: warn
           retention-days: 30
 
-      - name: 12 - Enforce installation and test results
+      - name: 10 - Enforce required tests AFTER reporting and uploading
         if: always()
         run: |
-          python3 - "$HOBBIT_WORKDIR" "$CI_LOG_DIR" <<'PY'
-          import json
-          import pathlib
-          import sys
-
-          root = pathlib.Path(sys.argv[1])
-          ci = pathlib.Path(sys.argv[2])
-          errors = []
-
-          exit_file = ci / "install.exit"
-          if not exit_file.exists():
-              errors.append("Installer never recorded completion")
-          elif exit_file.read_text().strip() != "0":
-              errors.append("Installer returned nonzero exit code")
-
-          clang = root / "build/bin/clang++"
-          if not clang.is_file():
-              errors.append("HOBBIT clang++ missing")
-
-          report = root / "results.json"
-          if not report.exists():
-              errors.append("Evaluation results missing")
-          else:
-              rows = json.loads(report.read_text())
-              valid = {
-                  "basic", "derived", "derived2",
-                  "multiple", "virtualbase", "heap",
-                  "array", "placement", "copy",
-                  "move", "vector"
-              }
-
-              for variant in (
-                  "gcc", "hobbit_O0",
-                  "hobbit_O1", "hobbit_O2"
-              ):
-                  compiled = any(
-                      r.get("variant") == variant
-                      and r.get("case") == "suite"
-                      and r.get("phase") == "compile"
-                      and r.get("exit_code") == 0
-                      for r in rows
-                  )
-                  if not compiled:
-                      errors.append(f"{variant}: compile failed")
-
-                  passes = {
-                      r.get("case")
-                      for r in rows
-                      if r.get("variant") == variant
-                      and r.get("phase") == "run"
-                      and r.get("detail") == "PASS"
-                  }
-                  missing = valid - passes
-                  if missing:
-                      errors.append(
-                          f"{variant}: functional failures "
-                          + ", ".join(sorted(missing))
-                      )
-
-              hash_ok = any(
-                  r.get("case") == "hash"
-                  and r.get("phase") == "run"
-                  and r.get("detail") == "PASS"
-                  for r in rows
-              )
-              if not hash_ok:
-                  errors.append("Hash runtime test failed")
-
-          print("=" * 70)
-          print("FINAL CI VERDICT")
-          print("=" * 70)
-
-          if errors:
-              print("STATUS: FAILED")
-              for error in errors:
-                  print("FAIL:", error)
-                  print("::error::" + error)
+          set -Eeuo pipefail
+          if [[ ! -f "$CI_LOG_DIR/verdict.json" ]]; then
+            echo '::error::Final verdict file missing'
+            exit 1
+          fi
+          python3 - "$CI_LOG_DIR/verdict.json" <<'PY_VERDICT'
+          import json,sys
+          v=json.load(open(sys.argv[1]))
+          print('================ FINAL CI VERDICT ================')
+          if not v['passed']:
+              for p in v['problems']:
+                  print('::error::'+p)
+              print('STATUS: FAILED')
               sys.exit(1)
-
-          print("STATUS: PASS")
-          print("Installation and required functional tests passed.")
-          print("Corruption probe results require separate review.")
-          PY
+          print('STATUS: PASS - build and required functional tests completed')
+          print('Corruption probe observations still require interpretation.')
+          PY_VERDICT
