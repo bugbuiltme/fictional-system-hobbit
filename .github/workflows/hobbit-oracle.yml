@@ -1,11 +1,12 @@
-name: HOBBIT Oracle v3 - Self Contained Ultra Verbose
+name: HOBBIT Oracle v4 - REAL Oracle Compiler Build and Test
+run-name: "HOBBIT v4 | Oracle hobbit | ${{ github.event_name }} | ${{ github.run_number }}"
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/hobbit-oracle-v3.yml"
+      - ".github/workflows/hobbit-oracle-v4.yml"
 
 permissions:
   contents: read
@@ -18,7 +19,7 @@ jobs:
   hobbit-oracle:
     name: Install, compile, evaluate, and summarize on hobbit
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 360
+    timeout-minutes: 720
     defaults:
       run:
         shell: bash
@@ -28,6 +29,7 @@ jobs:
       HOBBIT_JOBS: "1"
       HOBBIT_SWAP_GB: "8"
       PYTHONUNBUFFERED: "1"
+      HOBBIT_WORKFLOW_VERSION: "v4"
 
     steps:
       - name: 01 - Establish log paths and verify runner
@@ -36,7 +38,13 @@ jobs:
           CI_LOG_DIR="$RUNNER_TEMP/hobbit-ci-$GITHUB_RUN_ID"
           echo "CI_LOG_DIR=$CI_LOG_DIR" >> "$GITHUB_ENV"
           mkdir -p "$CI_LOG_DIR"
-          echo "WORKFLOW_VERSION=v3"
+          echo "WORKFLOW_VERSION=v4"
+          echo "::notice title=Correct workflow::This is HOBBIT v4, not the default CI build job."
+          echo "::group::WORKFLOW IDENTITY"
+          echo "Workflow: $GITHUB_WORKFLOW"
+          echo "Workflow ref: $GITHUB_WORKFLOW_REF"
+          echo "Runner: $RUNNER_NAME"
+          echo "::endgroup::"
           echo "CI_LOG_DIR=$CI_LOG_DIR"
           echo "This is the embedded HOBBIT workflow, NOT the Hello world starter workflow."
           echo "RUNNER_NAME=$RUNNER_NAME OS=$RUNNER_OS ARCH=$RUNNER_ARCH"
@@ -561,12 +569,15 @@ jobs:
           echo "Started: $(date -Is)"
           echo "Workdir: $HOBBIT_WORKDIR"
           echo "Build jobs: $HOBBIT_JOBS; requested swap: $HOBBIT_SWAP_GB GiB"
+          echo "::group::Embedded HOBBIT installer execution"
           start=$(date +%s)
           bash "$CI_LOG_DIR/hobbit-installer.sh" 2>&1 | tee "$CI_LOG_DIR/installer-console.log"
           rc=${PIPESTATUS[0]}
+          echo "::endgroup::"
           echo "$rc" > "$CI_LOG_DIR/installer.exit"
           echo "$(($(date +%s)-start))" > "$CI_LOG_DIR/installer.duration-seconds"
           echo "Installer exit code: $rc"
+          echo "::notice title=HOBBIT build completed::Installer returned exit code $rc; post-run analysis and artifact upload follow."
           exit "$rc"
 
       - name: 05 - Independent post-run evaluation and log classification
@@ -679,7 +690,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hobbit-oracle-v3-ultra-${{ github.run_id }}
+          name: hobbit-oracle-v4-ultra-${{ github.run_id }}
           path: ${{ env.CI_LOG_DIR }}/
           if-no-files-found: warn
           retention-days: 30
