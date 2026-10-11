@@ -1,11 +1,11 @@
-name: HOBBIT Oracle - Self Contained Ultra Verbose
+name: HOBBIT Oracle v2 - Self Contained Ultra Verbose
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
     paths:
-      - ".github/workflows/hobbit-oracle-self-contained.yml"
+      - ".github/workflows/hobbit-oracle-v2.yml"
 
 permissions:
   contents: read
@@ -28,15 +28,19 @@ jobs:
       HOBBIT_JOBS: "1"
       HOBBIT_SWAP_GB: "8"
       PYTHONUNBUFFERED: "1"
+      CI_LOG_DIR: ${{ runner.temp }}/hobbit-ci-${{ github.run_id }}
 
     steps:
       - name: 01 - Establish log paths and verify runner
         run: |
           set -Eeuo pipefail
-          echo "CI_LOG_DIR=$RUNNER_TEMP/hobbit-ci-$GITHUB_RUN_ID" >> "$GITHUB_ENV"
-          mkdir -p "$RUNNER_TEMP/hobbit-ci-$GITHUB_RUN_ID"
+          mkdir -p "$CI_LOG_DIR"
+          echo "WORKFLOW_VERSION=v2"
+          echo "CI_LOG_DIR=$CI_LOG_DIR"
+          echo "This is the embedded HOBBIT workflow, NOT the Hello world starter workflow."
           echo "RUNNER_NAME=$RUNNER_NAME OS=$RUNNER_OS ARCH=$RUNNER_ARCH"
           echo "REPOSITORY=$GITHUB_REPOSITORY SHA=$GITHUB_SHA"
+          echo "WORKFLOW_REF=$GITHUB_WORKFLOW_REF"
           echo "USER=$(id -un) HOME=$HOME HOST=$(hostname)"
           [[ "$RUNNER_NAME" == "hobbit" ]] || { echo '::error::Wrong runner: expected hobbit'; exit 1; }
           [[ "$(uname -m)" == x86_64 ]] || { echo '::error::Requires x86_64'; exit 1; }
@@ -674,8 +678,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: hobbit-oracle-ultra-${{ github.run_id }}
-          path: ${{ runner.temp }}/hobbit-ci-${{ github.run_id }}/
+          name: hobbit-oracle-v2-ultra-${{ github.run_id }}
+          path: ${{ env.CI_LOG_DIR }}/
           if-no-files-found: warn
           retention-days: 30
 
