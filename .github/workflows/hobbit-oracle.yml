@@ -19,7 +19,7 @@ jobs:
   hobbit-oracle:
     name: Install, compile, evaluate, and summarize on hobbit
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 720
+    timeout-minutes: 7200
     defaults:
       run:
         shell: bash
